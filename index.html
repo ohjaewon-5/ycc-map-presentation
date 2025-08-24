@@ -3,12 +3,12 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- defer 속성을 추가하여 스크립트 로딩 순서 문제 해결 -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
         html, body { height: 100%; padding: 0; margin: 0; }
         #map { width: 100%; height: 100%; }
-        /* 팝업창 내부 스타일 (추가) */
         .leaflet-popup-content-wrapper { border-radius: 5px; }
         .popup-content { text-align: center; }
         .popup-content h3 { margin: 0 0 10px 0; }
@@ -19,4 +19,74 @@
 <body>
     <div id="map"></div>
     <script>
-        // 1. 지도 
+    // HTML 문서가 완전히 로드된 후에만 스크립트가 실행되도록 이벤트 리스너 추가
+    document.addEventListener('DOMContentLoaded', function () {
+    
+        // 1. 지도 초기화 (대한민국 중심)
+        var map = L.map('map').setView([36.5, 127.5], 7); // [위도, 경도], 줌 레벨
+
+        // 2. 지도 배경 설정
+        L.tileLayer('https://tiles.osm.kr/hot/{z}/{x}/{y}.png', {
+            maxZoom: 18,
+            attribution: '&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        /*
+        // 3. 맞춤 아이콘 정의 (일단 주석 처리하여 비활성화)
+        var yccIcon = L.icon({
+            iconUrl: 'https://i.ibb.co/LQXqgS7/ycc-logo-icon.png',
+            iconSize: [40, 40],
+        });
+        var oemIcon = L.icon({
+            iconUrl: 'https://i.ibb.co/3k56G3P/oem-icon.png',
+            iconSize: [35, 35],
+        });
+        */
+
+        // 4. 각 공장 위치 및 정보 데이터
+        var locations = [
+            {
+                name: "유한크로락스 향남공장 (Strategic Hub)",
+                lat: 37.1358,
+                lon: 126.9142,
+                popupContent: `
+                    <div class="popup-content">
+                        <h3>향남공장 (In-House Plant)</h3>
+                        <p><b>품질과 안정성의 중심</b></p>
+                        <img src="https://i.ibb.co/L50H8h4/plant-view.jpg" alt="향남공장 전경">
+                    </div>`
+            },
+            {
+                name: "자연나라 (OEM Partner)",
+                lat: 36.9824,
+                lon: 127.5255,
+                popupContent: `
+                    <div class="popup-content">
+                        <h3>자연나라</h3>
+                        <p><b>스프레이 제품군 전문 생산</b></p>
+                        <img src="https://i.ibb.co/hV723zZ/spray-products.jpg" alt="스프레이 제품">
+                    </div>`
+            },
+            {
+                name: "FUCO (OEM Partner)",
+                lat: 35.9863,
+                lon: 126.7323,
+                popupContent: `
+                    <div class="popup-content">
+                        <h3>FUCO</h3>
+                        <p><b>분말 제품군 전문 생산</b></p>
+                        <img src="https://i.ibb.co/5cQf1qf/powder-products.jpg" alt="분말 제품">
+                    </div>`
+            }
+        ];
+
+        // 5. 모든 위치에 마커와 팝업창 추가
+        locations.forEach(function(loc) {
+            // 맞춤 아이콘 대신 기본 마커를 사용하도록 수정
+            var marker = L.marker([loc.lat, loc.lon]).addTo(map);
+            marker.bindPopup(loc.popupContent);
+        });
+    });
+    </script>
+</body>
+</html>
