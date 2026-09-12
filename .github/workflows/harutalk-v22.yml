@@ -1,0 +1,183 @@
+name: HaruTalk v2.2 language lock validation
+
+on:
+  push:
+    branches: [ harutalk-build ]
+    paths:
+      - 'harutalk-v22-patch.py'
+      - '.github/workflows/harutalk-v22.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harutalk-v22-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore v2.1 base and apply v2.2 language lock
+        run: |
+          base64 -d harutalk-src-v2.1.b64 > harutalk-v2.1.tgz
+          mkdir -p harutalk
+          tar -xzf harutalk-v2.1.tgz --strip-components=1 -C harutalk
+          python3 harutalk-v22-patch.py
+          grep -q "versionName '2.2.0'" harutalk/app/build.gradle
+          grep -q '자동 언어감지 OFF' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q 'EXTRA_LANGUAGE, languageTag' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q 'Locale.setDefault(forcedLocale)' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          ! grep -q 'launchFallbackRecognizer(' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q '원문 복사' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q '번역 복사' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Clean build, unit test and lint
+        working-directory: harutalk
+        run: |
+          gradle --no-daemon --stacktrace clean testDebugUnitTest lintDebug assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          unzip -t app/build/outputs/apk/debug/app-debug.apk >/dev/null
+          sha256sum app/build/outputs/apk/debug/app-debug.apk | tee ../v22-apk-sha256.txt
+          keytool -printcert -jarfile app/build/outputs/apk/debug/app-debug.apk > ../v22-cert.txt
+
+      - name: Write Android 16 speech UI smoke script
+        run: |
+          cat > v22-smoke.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+          mkdir -p v22-diagnostics
+          APK="$(pwd)/harutalk/app/build/outputs/apk/debug/app-debug.apk"
+          PKG="com.harutalk.app.debug"
+          ACT="com.harutalk.app.MainActivity"
+
+          adb devices -l > v22-diagnostics/device.txt 2>&1
+          adb shell getprop ro.build.version.sdk > v22-diagnostics/api-level.txt 2>&1 || true
+          sleep 25
+
+          set +e
+          timeout 300s adb install --no-streaming -r "$APK" > v22-diagnostics/install.txt 2>&1
+          INSTALL_RC=$?
+          set -e
+
+          adb shell pm grant "$PKG" android.permission.RECORD_AUDIO > v22-diagnostics/grant-mic.txt 2>&1 || true
+          adb logcat -c || true
+          adb shell am force-stop "$PKG" || true
+
+          set +e
+          timeout 60s adb shell am start -W -n "$PKG/$ACT" > v22-diagnostics/start.txt 2>&1
+          START_RC=$?
+          set -e
+          sleep 10
+
+          PID1="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+          timeout 30s adb shell uiautomator dump /sdcard/v22-ui.xml > v22-diagnostics/uiautomator.txt 2>&1 || true
+          adb pull /sdcard/v22-ui.xml v22-diagnostics/ui.xml > v22-diagnostics/ui-pull.txt 2>&1 || true
+
+          python3 - <<'PY' > v22-diagnostics/ui-check.txt
+          import re, xml.etree.ElementTree as ET
+          root=ET.parse('v22-diagnostics/ui.xml').getroot()
+          vals={'title':0,'ko_mic':0,'ja_mic':0,'lang_lock':0}
+          tap=None
+          for n in root.iter('node'):
+              text=n.attrib.get('text','')
+              if text=='하루톡': vals['title']=1
+              if text.startswith('🎤') and '한국어' in text:
+                  vals['ko_mic']=1
+                  m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',n.attrib.get('bounds',''))
+                  if m:
+                      x1,y1,x2,y2=map(int,m.groups()); tap=((x1+x2)//2,(y1+y2)//2)
+              if text.startswith('🎤') and '日本語' in text: vals['ja_mic']=1
+              if '자동 언어감지 OFF' in text: vals['lang_lock']=1
+          for k,v in vals.items(): print(f'{k}={v}')
+          if tap:
+              print(f'tap_x={tap[0]}')
+              print(f'tap_y={tap[1]}')
+          PY
+
+          TAP_X=$(sed -n 's/^tap_x=//p' v22-diagnostics/ui-check.txt | tail -1)
+          TAP_Y=$(sed -n 's/^tap_y=//p' v22-diagnostics/ui-check.txt | tail -1)
+          if [ -n "$TAP_X" ] && [ -n "$TAP_Y" ]; then
+            adb shell input tap "$TAP_X" "$TAP_Y" > v22-diagnostics/mic-tap.txt 2>&1 || true
+            sleep 8
+          fi
+
+          PID2="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+          adb shell dumpsys activity activities > v22-diagnostics/activity-after-mic.txt 2>&1 || true
+          adb exec-out screencap -p > v22-diagnostics/screen-after-mic.png 2>/dev/null || true
+          timeout 30s adb logcat -d -v threadtime > v22-diagnostics/logcat.txt 2>&1 || true
+          grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' v22-diagnostics/logcat.txt > v22-diagnostics/fatal.txt || true
+
+          TITLE=$(sed -n 's/^title=//p' v22-diagnostics/ui-check.txt | tail -1)
+          KO_MIC=$(sed -n 's/^ko_mic=//p' v22-diagnostics/ui-check.txt | tail -1)
+          JA_MIC=$(sed -n 's/^ja_mic=//p' v22-diagnostics/ui-check.txt | tail -1)
+          LOCK=$(sed -n 's/^lang_lock=//p' v22-diagnostics/ui-check.txt | tail -1)
+
+          FAIL=0
+          {
+            echo "install_rc=$INSTALL_RC"
+            echo "start_rc=$START_RC"
+            echo "pid_before_mic=$PID1"
+            echo "pid_after_mic=$PID2"
+            echo "title=${TITLE:-0}"
+            echo "ko_mic=${KO_MIC:-0}"
+            echo "ja_mic=${JA_MIC:-0}"
+            echo "lang_lock=${LOCK:-0}"
+          } > v22-diagnostics/result.txt
+
+          if [ "$INSTALL_RC" -ne 0 ]; then FAIL=1; fi
+          if [ "$START_RC" -ne 0 ]; then FAIL=1; fi
+          if [ -z "$PID1" ] || [ -z "$PID2" ]; then FAIL=1; fi
+          if [ "${TITLE:-0}" != "1" ]; then FAIL=1; fi
+          if [ "${KO_MIC:-0}" != "1" ] || [ "${JA_MIC:-0}" != "1" ]; then FAIL=1; fi
+          if [ "${LOCK:-0}" != "1" ]; then FAIL=1; fi
+          if [ -s v22-diagnostics/fatal.txt ]; then FAIL=1; fi
+          echo "fail=$FAIL" >> v22-diagnostics/result.txt
+          cat v22-diagnostics/result.txt
+          exit "$FAIL"
+          EOF
+          chmod +x v22-smoke.sh
+
+      - name: Android 16 API 36 launch and microphone-button validation
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: aosp_atd
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: bash ./v22-smoke.sh
+
+      - name: Upload v2.2 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-v2.2-diagnostics
+          path: |
+            v22-diagnostics
+            v22-apk-sha256.txt
+            v22-cert.txt
+          if-no-files-found: error
+
+      - name: Upload tested v2.2 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-v2.2-tested-apk
+          path: harutalk/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
