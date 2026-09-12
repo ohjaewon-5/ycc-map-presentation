@@ -1,0 +1,100 @@
+name: HaruTalk macOS emulator smoke test
+
+on:
+  push:
+    branches: [ harutalk-build ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-smoke:
+    runs-on: macos-13
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract source
+        run: |
+          mkdir -p harutalk
+          tar -xzf harutalk-src.tgz --strip-components=1 -C harutalk
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build APK
+        working-directory: harutalk
+        run: gradle --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
+
+      - name: Write smoke script
+        run: |
+          cat > ci-smoke-macos.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+          mkdir -p ci-macos
+          APK="$(pwd)/harutalk/app/build/outputs/apk/debug/app-debug.apk"
+          PKG="com.harutalk.app.debug"
+          ACT="com.harutalk.app.MainActivity"
+
+          set +e
+          adb install -r "$APK" > ci-macos/install.txt 2>&1
+          INSTALL_RC=$?
+          adb logcat -c || true
+          adb shell am force-stop "$PKG" || true
+          adb shell am start -W -n "$PKG/$ACT" > ci-macos/start.txt 2>&1
+          START_RC=$?
+          sleep 10
+          PID="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+          adb logcat -d -v threadtime > ci-macos/logcat.txt 2>&1 || true
+          grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' ci-macos/logcat.txt > ci-macos/fatal.txt || true
+          set -e
+
+          FAIL=0
+          echo "install_rc=$INSTALL_RC" > ci-macos/result.txt
+          echo "start_rc=$START_RC" >> ci-macos/result.txt
+          echo "pid=$PID" >> ci-macos/result.txt
+          if [ "$INSTALL_RC" -ne 0 ]; then FAIL=1; fi
+          if [ "$START_RC" -ne 0 ]; then FAIL=1; fi
+          if [ -z "$PID" ]; then FAIL=1; fi
+          if [ -s ci-macos/fatal.txt ]; then FAIL=1; fi
+          echo "fail=$FAIL" >> ci-macos/result.txt
+          cat ci-macos/result.txt
+          cat ci-macos/start.txt || true
+          cat ci-macos/fatal.txt || true
+          exit "$FAIL"
+          EOF
+          chmod +x ci-smoke-macos.sh
+
+      - name: API 35 emulator install and launch
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: bash ./ci-smoke-macos.sh
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-macos-diagnostics
+          path: ci-macos
+          if-no-files-found: error
+
+      - name: Upload tested APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-macos-tested-apk
+          path: harutalk/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
