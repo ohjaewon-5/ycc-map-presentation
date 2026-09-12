@@ -1,0 +1,106 @@
+name: HaruTalk Android build and boot test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ harutalk-build ]
+    paths:
+      - 'harutalk-src.tgz'
+      - '.github/workflows/harutalk-android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract HaruTalk source
+        run: |
+          mkdir -p harutalk
+          tar -xzf harutalk-src.tgz --strip-components=1 -C harutalk
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Unit test, lint, compile and build
+        working-directory: harutalk
+        run: gradle --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
+      - name: Verify APK
+        working-directory: harutalk
+        run: |
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          ls -lh app/build/outputs/apk/debug/app-debug.apk
+          unzip -t app/build/outputs/apk/debug/app-debug.apk >/dev/null
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-debug-apk
+          path: harutalk/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  emulator-smoke-test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract HaruTalk source
+        run: |
+          mkdir -p harutalk
+          tar -xzf harutalk-src.tgz --strip-components=1 -C harutalk
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build debug APK
+        working-directory: harutalk
+        run: gradle --no-daemon --stacktrace assembleDebug
+      - name: Boot API 35 emulator, install and launch
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            set -euo pipefail
+            APK=harutalk/app/build/outputs/apk/debug/app-debug.apk
+            adb install -r "$APK"
+            adb logcat -c
+            adb shell am force-stop com.harutalk.app.debug || true
+            adb shell am start -W -n com.harutalk.app.debug/com.harutalk.app.MainActivity
+            sleep 6
+            PID="$(adb shell pidof com.harutalk.app.debug | tr -d '\r')"
+            test -n "$PID"
+            echo "HaruTalk PID=$PID"
+            adb shell uiautomator dump /sdcard/harutalk-ui.xml >/dev/null
+            adb shell cat /sdcard/harutalk-ui.xml | grep -F '하루톡'
+            adb shell dumpsys activity activities | grep -F 'com.harutalk.app.debug/com.harutalk.app.MainActivity'
+            if adb logcat -d -t 1000 | grep -E 'FATAL EXCEPTION|AndroidRuntime.*com\.harutalk\.app\.debug|Process: com\.harutalk\.app\.debug'; then
+              echo 'HaruTalk crash detected in logcat'
+              exit 1
+            fi
+            echo 'HaruTalk startup smoke test passed.'
+      - name: Capture emulator log on failure
+        if: failure()
+        run: adb logcat -d > harutalk-emulator-logcat.txt || true
+      - name: Upload emulator failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-emulator-logcat
+          path: harutalk-emulator-logcat.txt
+          if-no-files-found: ignore
