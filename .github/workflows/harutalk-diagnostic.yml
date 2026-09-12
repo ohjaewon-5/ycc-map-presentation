@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: harutalk-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   diagnose:
     runs-on: ubuntu-latest
@@ -59,9 +63,6 @@ jobs:
           adb shell getprop ro.build.version.sdk > ci-diagnostics/api-level.txt 2>&1 || true
           adb shell getprop sys.boot_completed > ci-diagnostics/boot-completed.txt 2>&1 || true
 
-          # The software-emulated API 35 runner is very slow immediately after boot.
-          # Give PackageManager time to settle and use non-streaming install so a timeout
-          # cannot leave a partially transferred base.apk.
           sleep 30
           adb shell pm trim-caches 256M >/dev/null 2>&1 || true
 
