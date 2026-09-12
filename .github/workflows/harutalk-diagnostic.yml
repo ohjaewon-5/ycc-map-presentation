@@ -43,6 +43,74 @@ jobs:
           sha256sum "$APK" | tee apk-sha256.txt
           ls -lh "$APK"
 
+      - name: Write single-process emulator smoke script
+        run: |
+          cat > ci-smoke.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+          mkdir -p ci-diagnostics
+
+          APK="$(pwd)/harutalk/app/build/outputs/apk/debug/app-debug.apk"
+          PKG="com.harutalk.app.debug"
+          ACT="com.harutalk.app.MainActivity"
+
+          echo '=== adb devices ===' | tee ci-diagnostics/device.txt
+          adb devices -l | tee -a ci-diagnostics/device.txt
+          adb shell getprop ro.build.version.sdk > ci-diagnostics/api-level.txt 2>&1 || true
+
+          set +e
+          timeout 45s adb install -r "$APK" > ci-diagnostics/install.txt 2>&1
+          INSTALL_RC=$?
+          set -e
+
+          adb shell pm path "$PKG" > ci-diagnostics/package-path.txt 2>&1 || true
+          adb shell dumpsys package "$PKG" > ci-diagnostics/package.txt 2>&1 || true
+          adb logcat -c || true
+          adb shell am force-stop "$PKG" || true
+
+          set +e
+          timeout 45s adb shell am start -W -n "$PKG/$ACT" > ci-diagnostics/start.txt 2>&1
+          START_RC=$?
+          set -e
+
+          sleep 10
+          PID="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+
+          adb shell dumpsys activity activities > ci-diagnostics/activity.txt 2>&1 || true
+          adb shell dumpsys window windows > ci-diagnostics/window.txt 2>&1 || true
+          timeout 20s adb logcat -d -v threadtime > ci-diagnostics/logcat.txt 2>&1 || true
+
+          grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' ci-diagnostics/logcat.txt > ci-diagnostics/fatal.txt || true
+          grep -E 'am_crash|am_anr|Force finishing activity|Unable to start activity|RuntimeException|NoClassDefFoundError|VerifyError|UnsatisfiedLinkError' ci-diagnostics/logcat.txt > ci-diagnostics/suspect.txt || true
+
+          FAIL=0
+          {
+            echo "install_rc=$INSTALL_RC"
+            echo "start_rc=$START_RC"
+            echo "pid=$PID"
+          } > ci-diagnostics/result.txt
+
+          if [ "$INSTALL_RC" -ne 0 ]; then echo 'APK install failed' >> ci-diagnostics/result.txt; FAIL=1; fi
+          if [ "$START_RC" -ne 0 ]; then echo 'Activity start command failed' >> ci-diagnostics/result.txt; FAIL=1; fi
+          if [ -z "$PID" ]; then echo 'App process is not alive 10 seconds after launch' >> ci-diagnostics/result.txt; FAIL=1; fi
+          if [ -s ci-diagnostics/fatal.txt ]; then echo 'Fatal AndroidRuntime entry detected' >> ci-diagnostics/result.txt; FAIL=1; fi
+          echo "fail=$FAIL" >> ci-diagnostics/result.txt
+
+          echo '=== RESULT ==='
+          cat ci-diagnostics/result.txt
+          echo '=== INSTALL ==='
+          cat ci-diagnostics/install.txt || true
+          echo '=== START ==='
+          cat ci-diagnostics/start.txt || true
+          echo '=== FATAL ==='
+          cat ci-diagnostics/fatal.txt || true
+          echo '=== SUSPECT ==='
+          cat ci-diagnostics/suspect.txt || true
+
+          exit "$FAIL"
+          EOF
+          chmod +x ci-smoke.sh
+
       - name: API 35 install and launch diagnostics
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -52,67 +120,13 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: |
-            set +e
-            mkdir -p ci-diagnostics
-            APK=harutalk/app/build/outputs/apk/debug/app-debug.apk
-            PKG=com.harutalk.app.debug
-            ACT=com.harutalk.app.MainActivity
-
-            echo '=== adb devices ===' | tee ci-diagnostics/device.txt
-            adb devices -l | tee -a ci-diagnostics/device.txt
-            adb shell getprop ro.build.version.sdk > ci-diagnostics/api-level.txt 2>&1 || true
-
-            timeout 30s adb install -r "$APK" > ci-diagnostics/install.txt 2>&1
-            INSTALL_RC=$?
-
-            adb shell pm path "$PKG" > ci-diagnostics/package-path.txt 2>&1 || true
-            adb shell dumpsys package "$PKG" > ci-diagnostics/package.txt 2>&1 || true
-            adb logcat -c || true
-            adb shell am force-stop "$PKG" || true
-
-            timeout 30s adb shell am start -W -n "$PKG/$ACT" > ci-diagnostics/start.txt 2>&1
-            START_RC=$?
-            sleep 10
-
-            PID="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
-            adb shell dumpsys activity activities > ci-diagnostics/activity.txt 2>&1 || true
-            adb shell dumpsys window windows > ci-diagnostics/window.txt 2>&1 || true
-            timeout 15s adb logcat -d -v threadtime > ci-diagnostics/logcat.txt 2>&1 || true
-
-            grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' ci-diagnostics/logcat.txt > ci-diagnostics/fatal.txt || true
-            grep -E 'am_crash|am_anr|Force finishing activity|Unable to start activity|RuntimeException|NoClassDefFoundError|VerifyError|UnsatisfiedLinkError' ci-diagnostics/logcat.txt > ci-diagnostics/suspect.txt || true
-
-            FAIL=0
-            {
-              echo "install_rc=$INSTALL_RC"
-              echo "start_rc=$START_RC"
-              echo "pid=$PID"
-            } > ci-diagnostics/result.txt
-
-            if [ "$INSTALL_RC" -ne 0 ]; then echo 'APK install failed' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
-            if [ "$START_RC" -ne 0 ]; then echo 'Activity start command failed' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
-            if [ -z "$PID" ]; then echo 'App process is not alive 10 seconds after launch' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
-            if [ -s ci-diagnostics/fatal.txt ]; then echo 'Fatal AndroidRuntime entry detected' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
-
-            echo "fail=$FAIL" >> ci-diagnostics/result.txt
-            echo '=== RESULT ==='
-            cat ci-diagnostics/result.txt
-            echo '=== START ==='
-            cat ci-diagnostics/start.txt || true
-            echo '=== FATAL ==='
-            cat ci-diagnostics/fatal.txt || true
-            echo '=== SUSPECT ==='
-            cat ci-diagnostics/suspect.txt || true
-
-            if [ "$FAIL" -ne 0 ]; then exit 1; fi
-            echo 'HaruTalk API 35 launch smoke test PASSED.'
+          script: bash ./ci-smoke.sh
 
       - name: Upload emulator diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: HaruTalk-emulator-diagnostics-v2
+          name: HaruTalk-emulator-diagnostics-v3
           path: |
             ci-diagnostics
             apk-sha256.txt
@@ -122,6 +136,6 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: HaruTalk-tested-apk-v2
+          name: HaruTalk-tested-apk-v3
           path: harutalk/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
