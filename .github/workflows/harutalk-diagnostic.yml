@@ -11,7 +11,7 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -57,9 +57,16 @@ jobs:
           echo '=== adb devices ===' | tee ci-diagnostics/device.txt
           adb devices -l | tee -a ci-diagnostics/device.txt
           adb shell getprop ro.build.version.sdk > ci-diagnostics/api-level.txt 2>&1 || true
+          adb shell getprop sys.boot_completed > ci-diagnostics/boot-completed.txt 2>&1 || true
+
+          # The software-emulated API 35 runner is very slow immediately after boot.
+          # Give PackageManager time to settle and use non-streaming install so a timeout
+          # cannot leave a partially transferred base.apk.
+          sleep 30
+          adb shell pm trim-caches 256M >/dev/null 2>&1 || true
 
           set +e
-          timeout 45s adb install -r "$APK" > ci-diagnostics/install.txt 2>&1
+          timeout 300s adb install --no-streaming -r "$APK" > ci-diagnostics/install.txt 2>&1
           INSTALL_RC=$?
           set -e
 
@@ -69,16 +76,16 @@ jobs:
           adb shell am force-stop "$PKG" || true
 
           set +e
-          timeout 45s adb shell am start -W -n "$PKG/$ACT" > ci-diagnostics/start.txt 2>&1
+          timeout 60s adb shell am start -W -n "$PKG/$ACT" > ci-diagnostics/start.txt 2>&1
           START_RC=$?
           set -e
 
-          sleep 10
+          sleep 12
           PID="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
 
           adb shell dumpsys activity activities > ci-diagnostics/activity.txt 2>&1 || true
           adb shell dumpsys window windows > ci-diagnostics/window.txt 2>&1 || true
-          timeout 20s adb logcat -d -v threadtime > ci-diagnostics/logcat.txt 2>&1 || true
+          timeout 30s adb logcat -d -v threadtime > ci-diagnostics/logcat.txt 2>&1 || true
 
           grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' ci-diagnostics/logcat.txt > ci-diagnostics/fatal.txt || true
           grep -E 'am_crash|am_anr|Force finishing activity|Unable to start activity|RuntimeException|NoClassDefFoundError|VerifyError|UnsatisfiedLinkError' ci-diagnostics/logcat.txt > ci-diagnostics/suspect.txt || true
@@ -92,7 +99,7 @@ jobs:
 
           if [ "$INSTALL_RC" -ne 0 ]; then echo 'APK install failed' >> ci-diagnostics/result.txt; FAIL=1; fi
           if [ "$START_RC" -ne 0 ]; then echo 'Activity start command failed' >> ci-diagnostics/result.txt; FAIL=1; fi
-          if [ -z "$PID" ]; then echo 'App process is not alive 10 seconds after launch' >> ci-diagnostics/result.txt; FAIL=1; fi
+          if [ -z "$PID" ]; then echo 'App process is not alive 12 seconds after launch' >> ci-diagnostics/result.txt; FAIL=1; fi
           if [ -s ci-diagnostics/fatal.txt ]; then echo 'Fatal AndroidRuntime entry detected' >> ci-diagnostics/result.txt; FAIL=1; fi
           echo "fail=$FAIL" >> ci-diagnostics/result.txt
 
@@ -126,7 +133,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: HaruTalk-emulator-diagnostics-v3
+          name: HaruTalk-emulator-diagnostics-v4
           path: |
             ci-diagnostics
             apk-sha256.txt
@@ -136,6 +143,6 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: HaruTalk-tested-apk-v3
+          name: HaruTalk-tested-apk-v4
           path: harutalk/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
