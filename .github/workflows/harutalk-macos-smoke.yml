@@ -1,12 +1,14 @@
 name: HaruTalk macOS emulator smoke test
 
 on:
-  push:
-    branches: [ harutalk-build ]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: harutalk-macos-smoke
+  cancel-in-progress: true
 
 jobs:
   macos-smoke:
