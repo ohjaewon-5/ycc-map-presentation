@@ -1,0 +1,186 @@
+name: HaruTalk Android 16 API 36 smoke test
+
+on:
+  push:
+    branches: [ harutalk-build ]
+    paths:
+      - '.github/workflows/harutalk-api36.yml'
+      - 'harutalk-src.tgz'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harutalk-api36-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api36-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract source
+        run: |
+          mkdir -p harutalk
+          tar -xzf harutalk-src.tgz --strip-components=1 -C harutalk
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build and verify APK
+        working-directory: harutalk
+        run: |
+          gradle --no-daemon --stacktrace clean testDebugUnitTest lintDebug assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          unzip -t app/build/outputs/apk/debug/app-debug.apk >/dev/null
+          sha256sum app/build/outputs/apk/debug/app-debug.apk | tee ../api36-apk-sha256.txt
+
+      - name: Write Android 16 smoke script
+        run: |
+          cat > api36-smoke.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+          mkdir -p api36-diagnostics
+          APK="$(pwd)/harutalk/app/build/outputs/apk/debug/app-debug.apk"
+          PKG="com.harutalk.app.debug"
+          ACT="com.harutalk.app.MainActivity"
+
+          adb devices -l > api36-diagnostics/device.txt 2>&1
+          adb shell getprop ro.build.version.sdk > api36-diagnostics/api-level.txt 2>&1 || true
+          adb shell getprop ro.build.version.release > api36-diagnostics/android-version.txt 2>&1 || true
+          sleep 30
+
+          set +e
+          timeout 300s adb install --no-streaming -r "$APK" > api36-diagnostics/install.txt 2>&1
+          INSTALL_RC=$?
+          set -e
+
+          adb shell pm path "$PKG" > api36-diagnostics/package-path.txt 2>&1 || true
+          adb shell pm grant "$PKG" android.permission.RECORD_AUDIO > api36-diagnostics/grant-mic.txt 2>&1 || true
+          adb logcat -c || true
+          adb shell am force-stop "$PKG" || true
+
+          set +e
+          timeout 60s adb shell am start -W -n "$PKG/$ACT" > api36-diagnostics/start.txt 2>&1
+          START_RC=$?
+          set -e
+          sleep 15
+
+          PID1="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+          timeout 30s adb shell uiautomator dump /sdcard/harutalk-ui.xml > api36-diagnostics/uiautomator.txt 2>&1 || true
+          adb pull /sdcard/harutalk-ui.xml api36-diagnostics/ui.xml > api36-diagnostics/ui-pull.txt 2>&1 || true
+          adb exec-out screencap -p > api36-diagnostics/screen.png 2>/dev/null || true
+
+          UI_OK=0
+          MIC_FOUND=0
+          TAP_X=''
+          TAP_Y=''
+          if [ -s api36-diagnostics/ui.xml ]; then
+            python3 - <<'PY' > api36-diagnostics/ui-parse.txt
+          import re, xml.etree.ElementTree as ET
+          path='api36-diagnostics/ui.xml'
+          root=ET.parse(path).getroot()
+          found_title=False
+          found_mic=False
+          tap=None
+          for n in root.iter('node'):
+              text=n.attrib.get('text','')
+              if '하루톡' in text:
+                  found_title=True
+              if '한국어로 말하기' in text:
+                  found_mic=True
+                  b=n.attrib.get('bounds','')
+                  m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',b)
+                  if m:
+                      x1,y1,x2,y2=map(int,m.groups())
+                      tap=((x1+x2)//2,(y1+y2)//2)
+          print('title='+str(int(found_title)))
+          print('mic='+str(int(found_mic)))
+          if tap:
+              print('tap_x='+str(tap[0]))
+              print('tap_y='+str(tap[1]))
+          PY
+            UI_OK="$(sed -n 's/^title=//p' api36-diagnostics/ui-parse.txt | tail -1)"
+            MIC_FOUND="$(sed -n 's/^mic=//p' api36-diagnostics/ui-parse.txt | tail -1)"
+            TAP_X="$(sed -n 's/^tap_x=//p' api36-diagnostics/ui-parse.txt | tail -1)"
+            TAP_Y="$(sed -n 's/^tap_y=//p' api36-diagnostics/ui-parse.txt | tail -1)"
+          fi
+
+          if [ -n "$TAP_X" ] && [ -n "$TAP_Y" ]; then
+            adb shell input tap "$TAP_X" "$TAP_Y" > api36-diagnostics/mic-tap.txt 2>&1 || true
+            sleep 12
+          else
+            echo 'Korean microphone button coordinates unavailable' > api36-diagnostics/mic-tap.txt
+          fi
+
+          PID2="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+          adb shell dumpsys activity activities > api36-diagnostics/activity.txt 2>&1 || true
+          timeout 30s adb logcat -d -v threadtime > api36-diagnostics/logcat.txt 2>&1 || true
+          grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' api36-diagnostics/logcat.txt > api36-diagnostics/fatal.txt || true
+          grep -E 'am_crash|am_anr|Unable to start activity|RuntimeException|NoClassDefFoundError|VerifyError|UnsatisfiedLinkError' api36-diagnostics/logcat.txt > api36-diagnostics/suspect.txt || true
+
+          FAIL=0
+          {
+            echo "install_rc=$INSTALL_RC"
+            echo "start_rc=$START_RC"
+            echo "pid_after_launch=$PID1"
+            echo "ui_title_found=${UI_OK:-0}"
+            echo "mic_button_found=${MIC_FOUND:-0}"
+            echo "pid_after_mic=$PID2"
+          } > api36-diagnostics/result.txt
+
+          if [ "$INSTALL_RC" -ne 0 ]; then echo 'APK install failed' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ "$START_RC" -ne 0 ]; then echo 'Activity start failed' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ -z "$PID1" ]; then echo 'Process missing after launch' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ "${UI_OK:-0}" != "1" ]; then echo 'HaruTalk title not found in UI hierarchy' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ "${MIC_FOUND:-0}" != "1" ]; then echo 'Korean microphone button not found in UI hierarchy' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ -z "$PID2" ]; then echo 'Process missing after microphone button interaction' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ -s api36-diagnostics/fatal.txt ]; then echo 'Fatal AndroidRuntime entry detected' >> api36-diagnostics/result.txt; FAIL=1; fi
+          echo "fail=$FAIL" >> api36-diagnostics/result.txt
+
+          cat api36-diagnostics/result.txt
+          cat api36-diagnostics/start.txt || true
+          cat api36-diagnostics/fatal.txt || true
+          exit "$FAIL"
+          EOF
+          chmod +x api36-smoke.sh
+
+      - name: Boot Android 16 emulator and exercise microphone button
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: bash ./api36-smoke.sh
+
+      - name: Upload Android 16 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-api36-diagnostics
+          path: |
+            api36-diagnostics
+            api36-apk-sha256.txt
+          if-no-files-found: error
+
+      - name: Upload Android 16 tested APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-api36-tested-apk
+          path: harutalk/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
