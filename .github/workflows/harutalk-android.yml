@@ -66,7 +66,7 @@ jobs:
       - name: Build debug APK
         working-directory: harutalk
         run: gradle --no-daemon --stacktrace assembleDebug
-      - name: Boot API 35 emulator, install and launch
+      - name: Boot API 35 emulator, install, launch and capture diagnostics
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -76,31 +76,50 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           script: |
-            set -euo pipefail
+            set +e
+            mkdir -p ci-diagnostics
             APK=harutalk/app/build/outputs/apk/debug/app-debug.apk
-            adb install -r "$APK"
-            adb logcat -c
-            adb shell am force-stop com.harutalk.app.debug || true
-            adb shell am start -W -n com.harutalk.app.debug/com.harutalk.app.MainActivity
-            sleep 6
-            PID="$(adb shell pidof com.harutalk.app.debug | tr -d '\r')"
-            test -n "$PID"
-            echo "HaruTalk PID=$PID"
-            adb shell uiautomator dump /sdcard/harutalk-ui.xml >/dev/null
-            adb shell cat /sdcard/harutalk-ui.xml | grep -F '하루톡'
-            adb shell dumpsys activity activities | grep -F 'com.harutalk.app.debug/com.harutalk.app.MainActivity'
-            if adb logcat -d -t 1000 | grep -E 'FATAL EXCEPTION|AndroidRuntime.*com\.harutalk\.app\.debug|Process: com\.harutalk\.app\.debug'; then
-              echo 'HaruTalk crash detected in logcat'
+            PKG=com.harutalk.app.debug
+            ACT=com.harutalk.app.MainActivity
+
+            adb install -r "$APK" 2>&1 | tee ci-diagnostics/install.txt
+            INSTALL_RC=${PIPESTATUS[0]}
+            adb logcat -c || true
+            adb shell am force-stop "$PKG" || true
+
+            adb shell am start -W -n "$PKG/$ACT" 2>&1 | tee ci-diagnostics/start.txt
+            START_RC=${PIPESTATUS[0]}
+            sleep 8
+
+            PID="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r')"
+            printf 'install_rc=%s\nstart_rc=%s\npid=%s\n' "$INSTALL_RC" "$START_RC" "$PID" | tee ci-diagnostics/result.txt
+
+            adb shell dumpsys activity activities > ci-diagnostics/activity.txt 2>&1 || true
+            adb shell uiautomator dump /sdcard/harutalk-ui.xml > ci-diagnostics/uiautomator-command.txt 2>&1 || true
+            adb pull /sdcard/harutalk-ui.xml ci-diagnostics/ui.xml > ci-diagnostics/uiautomator-pull.txt 2>&1 || true
+            adb logcat -d -v threadtime > ci-diagnostics/logcat.txt 2>&1 || true
+            grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' ci-diagnostics/logcat.txt > ci-diagnostics/fatal.txt || true
+
+            FAIL=0
+            if [ "$INSTALL_RC" -ne 0 ]; then echo 'APK install failed' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
+            if [ "$START_RC" -ne 0 ]; then echo 'Activity start command failed' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
+            if [ -z "$PID" ]; then echo 'App process is not alive after launch' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
+            if [ -s ci-diagnostics/fatal.txt ]; then echo 'Fatal AndroidRuntime entry detected' | tee -a ci-diagnostics/result.txt; FAIL=1; fi
+
+            if [ "$FAIL" -ne 0 ]; then
+              echo '--- start output ---'
+              cat ci-diagnostics/start.txt || true
+              echo '--- fatal log ---'
+              cat ci-diagnostics/fatal.txt || true
               exit 1
             fi
-            echo 'HaruTalk startup smoke test passed.'
-      - name: Capture emulator log on failure
-        if: failure()
-        run: adb logcat -d > harutalk-emulator-logcat.txt || true
-      - name: Upload emulator failure log
-        if: failure()
+
+            echo 'HaruTalk launch smoke test passed.' | tee -a ci-diagnostics/result.txt
+            exit 0
+      - name: Upload emulator diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: HaruTalk-emulator-logcat
-          path: harutalk-emulator-logcat.txt
-          if-no-files-found: ignore
+          name: HaruTalk-emulator-diagnostics
+          path: ci-diagnostics
+          if-no-files-found: error
