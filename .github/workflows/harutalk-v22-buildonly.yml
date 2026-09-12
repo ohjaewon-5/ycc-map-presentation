@@ -1,0 +1,64 @@
+name: HaruTalk v2.2 final build artifact
+
+on:
+  push:
+    branches: [ harutalk-build ]
+    paths:
+      - '.github/workflows/harutalk-v22-buildonly.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore v2.1 base and apply v2.2 patch
+        run: |
+          base64 -d harutalk-src-v2.1.b64 > harutalk-v2.1.tgz
+          mkdir -p harutalk
+          tar -xzf harutalk-v2.1.tgz --strip-components=1 -C harutalk
+          python3 harutalk-v22-patch.py
+          grep -q "versionName '2.2.0'" harutalk/app/build.gradle
+          grep -q '자동 언어감지 OFF' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q 'EXTRA_LANGUAGE, languageTag' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q 'EXTRA_LANGUAGE_PREFERENCE, languageTag' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q 'Locale.setDefault(forcedLocale)' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          ! grep -q 'launchFallbackRecognizer(' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q '원문 복사' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q '번역 복사' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compile, unit test, lint and package
+        working-directory: harutalk
+        run: |
+          gradle --no-daemon --stacktrace clean testDebugUnitTest lintDebug assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+          sha256sum "$APK" | tee ../HaruTalk-v2.2.sha256.txt
+          keytool -printcert -jarfile "$APK" > ../HaruTalk-v2.2-cert.txt
+
+      - name: Upload final v2.2 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-v2.2-final-apk
+          path: |
+            harutalk/app/build/outputs/apk/debug/app-debug.apk
+            HaruTalk-v2.2.sha256.txt
+            HaruTalk-v2.2-cert.txt
+          if-no-files-found: error
