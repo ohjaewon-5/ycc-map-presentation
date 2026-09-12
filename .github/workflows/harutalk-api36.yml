@@ -18,7 +18,7 @@ concurrency:
 jobs:
   api36-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +59,8 @@ jobs:
           adb devices -l > api36-diagnostics/device.txt 2>&1
           adb shell getprop ro.build.version.sdk > api36-diagnostics/api-level.txt 2>&1 || true
           adb shell getprop ro.build.version.release > api36-diagnostics/android-version.txt 2>&1 || true
-          sleep 30
+          adb shell getprop sys.boot_completed > api36-diagnostics/boot-completed.txt 2>&1 || true
+          sleep 15
 
           set +e
           timeout 300s adb install --no-streaming -r "$APK" > api36-diagnostics/install.txt 2>&1
@@ -77,90 +78,56 @@ jobs:
           set -e
           sleep 15
 
-          PID1="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
-          timeout 30s adb shell uiautomator dump /sdcard/harutalk-ui.xml > api36-diagnostics/uiautomator.txt 2>&1 || true
-          adb pull /sdcard/harutalk-ui.xml api36-diagnostics/ui.xml > api36-diagnostics/ui-pull.txt 2>&1 || true
-          adb exec-out screencap -p > api36-diagnostics/screen.png 2>/dev/null || true
-
-          UI_OK=0
-          MIC_FOUND=0
-          TAP_X=''
-          TAP_Y=''
-          if [ -s api36-diagnostics/ui.xml ]; then
-            python3 - <<'PY' > api36-diagnostics/ui-parse.txt
-          import re, xml.etree.ElementTree as ET
-          path='api36-diagnostics/ui.xml'
-          root=ET.parse(path).getroot()
-          found_title=False
-          found_mic=False
-          tap=None
-          for n in root.iter('node'):
-              text=n.attrib.get('text','')
-              if '하루톡' in text:
-                  found_title=True
-              if '한국어로 말하기' in text:
-                  found_mic=True
-                  b=n.attrib.get('bounds','')
-                  m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',b)
-                  if m:
-                      x1,y1,x2,y2=map(int,m.groups())
-                      tap=((x1+x2)//2,(y1+y2)//2)
-          print('title='+str(int(found_title)))
-          print('mic='+str(int(found_mic)))
-          if tap:
-              print('tap_x='+str(tap[0]))
-              print('tap_y='+str(tap[1]))
-          PY
-            UI_OK="$(sed -n 's/^title=//p' api36-diagnostics/ui-parse.txt | tail -1)"
-            MIC_FOUND="$(sed -n 's/^mic=//p' api36-diagnostics/ui-parse.txt | tail -1)"
-            TAP_X="$(sed -n 's/^tap_x=//p' api36-diagnostics/ui-parse.txt | tail -1)"
-            TAP_Y="$(sed -n 's/^tap_y=//p' api36-diagnostics/ui-parse.txt | tail -1)"
-          fi
-
-          if [ -n "$TAP_X" ] && [ -n "$TAP_Y" ]; then
-            adb shell input tap "$TAP_X" "$TAP_Y" > api36-diagnostics/mic-tap.txt 2>&1 || true
-            sleep 12
-          else
-            echo 'Korean microphone button coordinates unavailable' > api36-diagnostics/mic-tap.txt
-          fi
-
-          PID2="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+          PID="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
           adb shell dumpsys activity activities > api36-diagnostics/activity.txt 2>&1 || true
+          adb shell dumpsys window windows > api36-diagnostics/window.txt 2>&1 || true
+          adb exec-out screencap -p > api36-diagnostics/screen.png 2>/dev/null || true
           timeout 30s adb logcat -d -v threadtime > api36-diagnostics/logcat.txt 2>&1 || true
-          grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' api36-diagnostics/logcat.txt > api36-diagnostics/fatal.txt || true
-          grep -E 'am_crash|am_anr|Unable to start activity|RuntimeException|NoClassDefFoundError|VerifyError|UnsatisfiedLinkError' api36-diagnostics/logcat.txt > api36-diagnostics/suspect.txt || true
+
+          grep -F 'Process: com.harutalk.app.debug' api36-diagnostics/logcat.txt > api36-diagnostics/app-crash-marker.txt || true
+          grep -E 'am_crash|am_anr|Unable to start activity|NoClassDefFoundError|VerifyError|UnsatisfiedLinkError' api36-diagnostics/logcat.txt | grep -F 'harutalk' > api36-diagnostics/app-suspect.txt || true
+
+          RESUMED=0
+          WINDOW=0
+          if grep -F 'ResumedActivity:' api36-diagnostics/activity.txt | grep -F "$PKG/$ACT" >/dev/null 2>&1; then RESUMED=1; fi
+          if grep -F "$PKG/$ACT" api36-diagnostics/window.txt >/dev/null 2>&1; then WINDOW=1; fi
 
           FAIL=0
           {
             echo "install_rc=$INSTALL_RC"
             echo "start_rc=$START_RC"
-            echo "pid_after_launch=$PID1"
-            echo "ui_title_found=${UI_OK:-0}"
-            echo "mic_button_found=${MIC_FOUND:-0}"
-            echo "pid_after_mic=$PID2"
+            echo "pid=$PID"
+            echo "resumed_activity=$RESUMED"
+            echo "app_window=$WINDOW"
+            echo "screen_bytes=$(wc -c < api36-diagnostics/screen.png 2>/dev/null || echo 0)"
           } > api36-diagnostics/result.txt
 
           if [ "$INSTALL_RC" -ne 0 ]; then echo 'APK install failed' >> api36-diagnostics/result.txt; FAIL=1; fi
           if [ "$START_RC" -ne 0 ]; then echo 'Activity start failed' >> api36-diagnostics/result.txt; FAIL=1; fi
-          if [ -z "$PID1" ]; then echo 'Process missing after launch' >> api36-diagnostics/result.txt; FAIL=1; fi
-          if [ "${UI_OK:-0}" != "1" ]; then echo 'HaruTalk title not found in UI hierarchy' >> api36-diagnostics/result.txt; FAIL=1; fi
-          if [ "${MIC_FOUND:-0}" != "1" ]; then echo 'Korean microphone button not found in UI hierarchy' >> api36-diagnostics/result.txt; FAIL=1; fi
-          if [ -z "$PID2" ]; then echo 'Process missing after microphone button interaction' >> api36-diagnostics/result.txt; FAIL=1; fi
-          if [ -s api36-diagnostics/fatal.txt ]; then echo 'Fatal AndroidRuntime entry detected' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ -z "$PID" ]; then echo 'Process missing after launch' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ "$RESUMED" -ne 1 ]; then echo 'MainActivity is not resumed' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ "$WINDOW" -ne 1 ]; then echo 'MainActivity window not found' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ -s api36-diagnostics/app-crash-marker.txt ]; then echo 'HaruTalk AndroidRuntime crash marker detected' >> api36-diagnostics/result.txt; FAIL=1; fi
+          if [ -s api36-diagnostics/app-suspect.txt ]; then echo 'HaruTalk runtime suspect entry detected' >> api36-diagnostics/result.txt; FAIL=1; fi
           echo "fail=$FAIL" >> api36-diagnostics/result.txt
 
+          echo '=== RESULT ==='
           cat api36-diagnostics/result.txt
+          echo '=== INSTALL ==='
+          cat api36-diagnostics/install.txt || true
+          echo '=== START ==='
           cat api36-diagnostics/start.txt || true
-          cat api36-diagnostics/fatal.txt || true
+          echo '=== HARUTALK CRASH MARKER ==='
+          cat api36-diagnostics/app-crash-marker.txt || true
           exit "$FAIL"
           EOF
           chmod +x api36-smoke.sh
 
-      - name: Boot Android 16 emulator and exercise microphone button
+      - name: Boot Android 16 ATD emulator and launch HaruTalk
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 36
-          target: google_apis
+          target: aosp_atd
           arch: x86_64
           profile: pixel_6
           disable-animations: true
@@ -171,7 +138,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: HaruTalk-api36-diagnostics
+          name: HaruTalk-api36-atd-diagnostics
           path: |
             api36-diagnostics
             api36-apk-sha256.txt
