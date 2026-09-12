@@ -1,0 +1,189 @@
+name: HaruTalk v2.1 Android 16 validation
+
+on:
+  push:
+    branches: [ harutalk-build ]
+    paths:
+      - 'harutalk-src-v2.1.b64'
+      - '.github/workflows/harutalk-v21.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harutalk-v21-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore v2.1 source
+        run: |
+          base64 -d harutalk-src-v2.1.b64 > harutalk-v2.1.tgz
+          mkdir -p harutalk
+          tar -xzf harutalk-v2.1.tgz --strip-components=1 -C harutalk
+          grep -q "versionName '2.1.0'" harutalk/app/build.gradle
+          grep -q '원문 복사' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q '번역 복사' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+          grep -q '전체 복사' harutalk/app/src/main/java/com/harutalk/app/MainActivity.java
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Clean build, unit test and lint
+        working-directory: harutalk
+        run: |
+          gradle --no-daemon --stacktrace clean testDebugUnitTest lintDebug assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          unzip -t app/build/outputs/apk/debug/app-debug.apk >/dev/null
+          sha256sum app/build/outputs/apk/debug/app-debug.apk | tee ../v21-apk-sha256.txt
+          keytool -printcert -jarfile app/build/outputs/apk/debug/app-debug.apk > ../v21-cert.txt
+
+      - name: Write Android 16 UI smoke script
+        run: |
+          cat > v21-smoke.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+          mkdir -p v21-diagnostics
+          APK="$(pwd)/harutalk/app/build/outputs/apk/debug/app-debug.apk"
+          PKG="com.harutalk.app.debug"
+          ACT="com.harutalk.app.MainActivity"
+
+          adb devices -l > v21-diagnostics/device.txt 2>&1
+          adb shell getprop ro.build.version.sdk > v21-diagnostics/api-level.txt 2>&1 || true
+          adb shell getprop ro.build.version.release > v21-diagnostics/android-version.txt 2>&1 || true
+          sleep 25
+
+          set +e
+          timeout 300s adb install --no-streaming -r "$APK" > v21-diagnostics/install.txt 2>&1
+          INSTALL_RC=$?
+          set -e
+
+          adb shell pm grant "$PKG" android.permission.RECORD_AUDIO > v21-diagnostics/grant-mic.txt 2>&1 || true
+          adb logcat -c || true
+          adb shell am force-stop "$PKG" || true
+
+          set +e
+          timeout 60s adb shell am start -W -n "$PKG/$ACT" > v21-diagnostics/start.txt 2>&1
+          START_RC=$?
+          set -e
+          sleep 12
+
+          PID="$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r\n')"
+          adb shell dumpsys activity activities > v21-diagnostics/activity.txt 2>&1 || true
+          adb shell dumpsys window windows > v21-diagnostics/window.txt 2>&1 || true
+          timeout 30s adb shell uiautomator dump /sdcard/v21-ui.xml > v21-diagnostics/uiautomator.txt 2>&1 || true
+          adb pull /sdcard/v21-ui.xml v21-diagnostics/ui.xml > v21-diagnostics/ui-pull.txt 2>&1 || true
+          adb exec-out screencap -p > v21-diagnostics/screen.png 2>/dev/null || true
+          timeout 30s adb logcat -d -v threadtime > v21-diagnostics/logcat.txt 2>&1 || true
+
+          python3 - <<'PY' > v21-diagnostics/ui-check.txt
+          import re, xml.etree.ElementTree as ET
+          p='v21-diagnostics/ui.xml'
+          out={'title':0,'ko_mic':0,'ja_mic':0,'input':0,'ko_send':0,'ja_send':0,'mic_above_input':0}
+          try:
+              root=ET.parse(p).getroot()
+              ko_y=input_y=None
+              for n in root.iter('node'):
+                  text=n.attrib.get('text','')
+                  b=n.attrib.get('bounds','')
+                  m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',b)
+                  cy=None
+                  if m:
+                      x1,y1,x2,y2=map(int,m.groups()); cy=(y1+y2)//2
+                  if text=='하루톡': out['title']=1
+                  if '한국어' in text and '말' not in text and text.startswith('🎤'):
+                      out['ko_mic']=1; ko_y=cy
+                  if '日本語' in text and text.startswith('🎤'):
+                      out['ja_mic']=1
+                  if text=='직접 입력':
+                      out['input']=1; input_y=cy
+                  if '한 → 日' in text: out['ko_send']=1
+                  if '日 → 한' in text: out['ja_send']=1
+              if ko_y is not None and input_y is not None and ko_y < input_y:
+                  out['mic_above_input']=1
+          except Exception as e:
+              print('parse_error='+repr(e))
+          for k,v in out.items(): print(f'{k}={v}')
+          PY
+
+          grep -E 'FATAL EXCEPTION|Process: com\.harutalk\.app\.debug|AndroidRuntime.*com\.harutalk\.app\.debug' v21-diagnostics/logcat.txt > v21-diagnostics/fatal.txt || true
+
+          TITLE=$(sed -n 's/^title=//p' v21-diagnostics/ui-check.txt | tail -1)
+          KO_MIC=$(sed -n 's/^ko_mic=//p' v21-diagnostics/ui-check.txt | tail -1)
+          JA_MIC=$(sed -n 's/^ja_mic=//p' v21-diagnostics/ui-check.txt | tail -1)
+          INPUT=$(sed -n 's/^input=//p' v21-diagnostics/ui-check.txt | tail -1)
+          KO_SEND=$(sed -n 's/^ko_send=//p' v21-diagnostics/ui-check.txt | tail -1)
+          JA_SEND=$(sed -n 's/^ja_send=//p' v21-diagnostics/ui-check.txt | tail -1)
+          MIC_ABOVE=$(sed -n 's/^mic_above_input=//p' v21-diagnostics/ui-check.txt | tail -1)
+
+          FAIL=0
+          {
+            echo "install_rc=$INSTALL_RC"
+            echo "start_rc=$START_RC"
+            echo "pid=$PID"
+            echo "title=${TITLE:-0}"
+            echo "ko_mic=${KO_MIC:-0}"
+            echo "ja_mic=${JA_MIC:-0}"
+            echo "input=${INPUT:-0}"
+            echo "ko_send=${KO_SEND:-0}"
+            echo "ja_send=${JA_SEND:-0}"
+            echo "mic_above_input=${MIC_ABOVE:-0}"
+          } > v21-diagnostics/result.txt
+
+          if [ "$INSTALL_RC" -ne 0 ]; then FAIL=1; fi
+          if [ "$START_RC" -ne 0 ]; then FAIL=1; fi
+          if [ -z "$PID" ]; then FAIL=1; fi
+          if [ "${TITLE:-0}" != "1" ]; then FAIL=1; fi
+          if [ "${KO_MIC:-0}" != "1" ]; then FAIL=1; fi
+          if [ "${JA_MIC:-0}" != "1" ]; then FAIL=1; fi
+          if [ "${KO_SEND:-0}" != "1" ]; then FAIL=1; fi
+          if [ "${JA_SEND:-0}" != "1" ]; then FAIL=1; fi
+          if [ -s v21-diagnostics/fatal.txt ]; then FAIL=1; fi
+          echo "fail=$FAIL" >> v21-diagnostics/result.txt
+          cat v21-diagnostics/result.txt
+          exit "$FAIL"
+          EOF
+          chmod +x v21-smoke.sh
+
+      - name: Android 16 API 36 UI launch validation
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: aosp_atd
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: bash ./v21-smoke.sh
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-v2.1-diagnostics
+          path: |
+            v21-diagnostics
+            v21-apk-sha256.txt
+            v21-cert.txt
+          if-no-files-found: error
+
+      - name: Upload tested v2.1 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaruTalk-v2.1-tested-apk
+          path: harutalk/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
